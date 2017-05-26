@@ -1,9 +1,21 @@
 package com.alibaba.otter.canal.example;
 
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileNotFoundException;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.RandomAccessFile;
+import java.nio.ByteBuffer;
+import java.nio.MappedByteBuffer;
+import java.nio.channels.FileChannel;
+import java.nio.channels.FileChannel.MapMode;
 import java.text.SimpleDateFormat;
+import java.util.ArrayList;
 import java.util.Date;
 import java.util.List;
 
+import com.google.common.primitives.Bytes;
 import org.apache.commons.lang.SystemUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -12,6 +24,8 @@ import org.springframework.util.Assert;
 import org.springframework.util.CollectionUtils;
 
 import com.alibaba.otter.canal.client.CanalConnector;
+import com.alibaba.otter.canal.model.ChangeRecord;
+import com.alibaba.otter.canal.model.ColumnChangeData;
 import com.alibaba.otter.canal.protocol.CanalEntry.Column;
 import com.alibaba.otter.canal.protocol.CanalEntry.Entry;
 import com.alibaba.otter.canal.protocol.CanalEntry.EntryType;
@@ -31,22 +45,22 @@ import com.google.protobuf.InvalidProtocolBufferException;
  */
 public class AbstractCanalClientTest {
 
-    protected final static Logger             logger             = LoggerFactory.getLogger(AbstractCanalClientTest.class);
-    protected static final String             SEP                = SystemUtils.LINE_SEPARATOR;
-    protected static final String             DATE_FORMAT        = "yyyy-MM-dd HH:mm:ss";
-    protected volatile boolean                running            = false;
-    protected Thread.UncaughtExceptionHandler handler            = new Thread.UncaughtExceptionHandler() {
+    protected final static Logger logger = LoggerFactory.getLogger(AbstractCanalClientTest.class);
+    protected static final String SEP = SystemUtils.LINE_SEPARATOR;
+    protected static final String DATE_FORMAT = "yyyy-MM-dd HH:mm:ss";
+    protected volatile boolean running = false;
+    protected Thread.UncaughtExceptionHandler handler = new Thread.UncaughtExceptionHandler() {
 
-                                                                     public void uncaughtException(Thread t, Throwable e) {
-                                                                         logger.error("parse events has an error", e);
-                                                                     }
-                                                                 };
-    protected Thread                          thread             = null;
-    protected CanalConnector                  connector;
-    protected static String                   context_format     = null;
-    protected static String                   row_format         = null;
-    protected static String                   transaction_format = null;
-    protected String                          destination;
+        public void uncaughtException(Thread t, Throwable e) {
+            logger.error("parse events has an error", e);
+        }
+    };
+    protected Thread thread = null;
+    protected CanalConnector connector;
+    protected static String context_format = null;
+    protected static String row_format = null;
+    protected static String transaction_format = null;
+    protected String destination;
 
     static {
         context_format = SEP + "****************************************************" + SEP;
@@ -149,8 +163,8 @@ public class AbstractCanalClientTest {
         }
 
         SimpleDateFormat format = new SimpleDateFormat(DATE_FORMAT);
-        logger.info(context_format, new Object[] { batchId, size, memsize, format.format(new Date()), startPosition,
-                endPosition });
+        logger.info(context_format,
+            new Object[] { batchId, size, memsize, format.format(new Date()), startPosition, endPosition });
     }
 
     protected String buildPositionForDump(Entry entry) {
@@ -161,12 +175,190 @@ public class AbstractCanalClientTest {
                + entry.getHeader().getExecuteTime() + "(" + format.format(date) + ")";
     }
 
+    /**
+     * 用于2017年阿里外部赛复赛使用的方法，将增量变更信息转化成比赛数据,并且写到外部文件
+     * 
+     * @param entry
+     */
+    protected void analyseEntryAndFlushToFile(Entry entry) {
+
+        RowChange rowChage = null;
+        try {
+            rowChage = RowChange.parseFrom(entry.getStoreValue());
+        } catch (Exception e) {
+            throw new RuntimeException("parse event has an error , data:" + entry.toString(), e);
+        }
+
+        // ----------1. 初始化ChangeRecord所需的成员变量---------------
+        // id由binlog文件名和offset组成
+        String id = entry.getHeader().getLogfileName() + entry.getHeader().getLogfileOffset();
+        // 时间戳，单位毫秒
+        String timestamp = String.valueOf(entry.getHeader().getExecuteTime());
+        // schema
+        String schema = entry.getHeader().getSchemaName();
+        // table
+        String table = entry.getHeader().getTableName();
+        // 变更类型
+        String type = null;
+        switch (rowChage.getEventType()) {
+            case INSERT:
+                type = "I";
+                break;
+            case UPDATE:
+                type = "U";
+                break;
+            case DELETE:
+                type = "D";
+                break;
+            default:
+                type = "Undefined";
+
+        }
+        if ("Undefined".equals(type)) {
+            throw new RuntimeException("event type is not defined , data:" + entry.toString());
+        }
+
+        // ----------2. 初始化ColumnChangeData List ---------------
+        //创建个byte数组
+        byte[] resultBytes=new byte[0];
+        logger.info("#################### List Size is:"+rowChage.getRowDatasList().size()+"  type:"+type+"##########\n");
+        for (RowData rowData : rowChage.getRowDatasList()) {
+            List<ColumnChangeData> changeDataList = new ArrayList<ColumnChangeData>();
+            if ("I".equals(type)) {
+                // 只有更新后的值
+                for (Column column : rowData.getAfterColumnsList()) {
+                    changeDataList.add(transferColumn(column, true));
+                }
+
+            } else if ("U".equals(type)) {
+                // 有更新前后的值
+                List columnNewList = rowData.getAfterColumnsList();
+                List columnOldList = rowData.getBeforeColumnsList();
+                changeDataList = transferColumnSetBoth(columnNewList, columnOldList);
+            } else if ("D".equals(type)) {
+                // 只有变更后的值
+                for (Column column : rowData.getBeforeColumnsList()) {
+                    changeDataList.add(transferColumn(column, false));
+                }
+            }
+
+            // ----------3. 构造ChangeRecord ---------------
+            ChangeRecord changeRecord = new ChangeRecord(id, timestamp, schema, table, type, changeDataList);
+            String resultStr = changeRecord.toString() + "\n";
+            //合并两个byte数组
+            resultBytes= Bytes.concat(resultBytes,resultStr.getBytes());
+
+        }
+        storeChangeToDisk(resultBytes);
+    }
+
+    /**
+     * 将结果写入外部文件，采用mapped memoery
+     * 
+     * @param resultBytes
+     */
+    protected void storeChangeToDisk(byte[] resultBytes) {
+        File destFile = new File("/Users/wanshao/work/canal_data/canal.txt");
+
+        FileChannel fileInputChannel = null;
+        try {
+            if(!destFile.exists()){
+                destFile.createNewFile();
+            }
+
+            //获取可写的file channel；使用FileInputStream是只读
+            RandomAccessFile raf   = new RandomAccessFile(destFile,"rw");
+            //设置指针位置为文件末尾
+            long fileLength = raf.length();
+            raf.seek(fileLength);
+            fileInputChannel = raf.getChannel();
+
+            //映射的字节数
+            long size = 1024*1024;
+            MappedByteBuffer buf = fileInputChannel.map(MapMode.READ_WRITE, fileInputChannel.position(), size);
+            buf.put(resultBytes);
+            buf.force();
+            fileInputChannel.close();
+        } catch (FileNotFoundException e) {
+            e.printStackTrace();
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+    /**
+     * 得到ColumnChangeData的时候，需要同时设置旧值和新值
+     * 
+     * @param columnNewList
+     * @param columnOldList
+     * @return
+     */
+    protected List<ColumnChangeData> transferColumnSetBoth(List<Column> columnNewList, List<Column> columnOldList) {
+        List<ColumnChangeData> columnChangeDataList = new ArrayList<ColumnChangeData>();
+
+        // new和old的length肯定一样的，所以这里随便选个
+        for (int i = 0; i < columnNewList.size(); i++) {
+            ColumnChangeData columnChangeData = new ColumnChangeData();
+            Column columnNew = columnNewList.get(i);
+            Column columnOld = columnOldList.get(i);
+            columnChangeData.setNewValue(columnNew.getValue());
+            columnChangeData.setOldValue(columnOld.getValue());
+            String isPrimaryKey = columnNew.getIsKey() ? "1" : "0";
+            columnChangeData.setPrimaryKey(isPrimaryKey);
+            String columnType = columnNew.getMysqlType();
+            if (columnType.startsWith("int")) {
+                // 为数字类型
+                columnChangeData.setColumnType("1");
+            } else {
+                // 为字符串类型
+                columnChangeData.setColumnType("2");
+            }
+            columnChangeData.setColumnName(columnNew.getName());
+            columnChangeDataList.add(columnChangeData);
+        }
+
+        return columnChangeDataList;
+    }
+
+    /**
+     * 根据column对象转化得到ColumnChangeData
+     * 
+     * @param column
+     * @param setNew true表示对new值set,false表示对old值set
+     * @return
+     */
+    protected ColumnChangeData transferColumn(Column column, boolean setNew) {
+        ColumnChangeData columnChangeData = new ColumnChangeData();
+        if (setNew) {
+            columnChangeData.setNewValue(column.getValue());
+            columnChangeData.setOldValue("NULL");
+        } else {
+            columnChangeData.setNewValue("NULL");
+            columnChangeData.setOldValue(column.getValue());
+        }
+
+        String isPrimaryKey = column.getIsKey() ? "1" : "0";
+        columnChangeData.setPrimaryKey(isPrimaryKey);
+        String columnType = column.getMysqlType();
+        if (columnType.startsWith("int")) {
+            // 为数字类型
+            columnChangeData.setColumnType("1");
+        } else {
+            // 为字符串类型
+            columnChangeData.setColumnType("2");
+        }
+        columnChangeData.setColumnName(column.getName());
+
+        return columnChangeData;
+    }
+
     protected void printEntry(List<Entry> entrys) {
         for (Entry entry : entrys) {
             long executeTime = entry.getHeader().getExecuteTime();
             long delayTime = new Date().getTime() - executeTime;
 
-            if (entry.getEntryType() == EntryType.TRANSACTIONBEGIN || entry.getEntryType() == EntryType.TRANSACTIONEND) {
+            if (entry.getEntryType() == EntryType.TRANSACTIONBEGIN
+                || entry.getEntryType() == EntryType.TRANSACTIONEND) {
                 if (entry.getEntryType() == EntryType.TRANSACTIONBEGIN) {
                     TransactionBegin begin = null;
                     try {
@@ -177,8 +369,8 @@ public class AbstractCanalClientTest {
                     // 打印事务头信息，执行的线程id，事务耗时
                     logger.info(transaction_format,
                         new Object[] { entry.getHeader().getLogfileName(),
-                                String.valueOf(entry.getHeader().getLogfileOffset()),
-                                String.valueOf(entry.getHeader().getExecuteTime()), String.valueOf(delayTime) });
+                                       String.valueOf(entry.getHeader().getLogfileOffset()),
+                                       String.valueOf(entry.getHeader().getExecuteTime()), String.valueOf(delayTime) });
                     logger.info(" BEGIN ----> Thread id: {}", begin.getThreadId());
                 } else if (entry.getEntryType() == EntryType.TRANSACTIONEND) {
                     TransactionEnd end = null;
@@ -192,8 +384,8 @@ public class AbstractCanalClientTest {
                     logger.info(" END ----> transaction id: {}", end.getTransactionId());
                     logger.info(transaction_format,
                         new Object[] { entry.getHeader().getLogfileName(),
-                                String.valueOf(entry.getHeader().getLogfileOffset()),
-                                String.valueOf(entry.getHeader().getExecuteTime()), String.valueOf(delayTime) });
+                                       String.valueOf(entry.getHeader().getLogfileOffset()),
+                                       String.valueOf(entry.getHeader().getExecuteTime()), String.valueOf(delayTime) });
                 }
 
                 continue;
@@ -211,24 +403,29 @@ public class AbstractCanalClientTest {
 
                 logger.info(row_format,
                     new Object[] { entry.getHeader().getLogfileName(),
-                            String.valueOf(entry.getHeader().getLogfileOffset()), entry.getHeader().getSchemaName(),
-                            entry.getHeader().getTableName(), eventType,
-                            String.valueOf(entry.getHeader().getExecuteTime()), String.valueOf(delayTime) });
+                                   String.valueOf(entry.getHeader().getLogfileOffset()),
+                                   entry.getHeader().getSchemaName(), entry.getHeader().getTableName(), eventType,
+                                   String.valueOf(entry.getHeader().getExecuteTime()), String.valueOf(delayTime) });
 
                 if (eventType == EventType.QUERY || rowChage.getIsDdl()) {
                     logger.info(" sql ----> " + rowChage.getSql() + SEP);
                     continue;
                 }
 
-                for (RowData rowData : rowChage.getRowDatasList()) {
-                    if (eventType == EventType.DELETE) {
-                        printColumn(rowData.getBeforeColumnsList());
-                    } else if (eventType == EventType.INSERT) {
-                        printColumn(rowData.getAfterColumnsList());
-                    } else {
-                        printColumn(rowData.getAfterColumnsList());
-                    }
-                }
+                // 做一些数据转化，生成外部赛使用的数据
+                logger.info("############### rowChangeDataList size: "+rowChage.getRowDatasList().size()+"#########\n");
+                analyseEntryAndFlushToFile(entry);
+
+
+                //for (RowData rowData : rowChage.getRowDatasList()) {
+                //    if (eventType == EventType.DELETE) {
+                //        printColumn(rowData.getBeforeColumnsList());
+                //    } else if (eventType == EventType.INSERT) {
+                //        printColumn(rowData.getAfterColumnsList());
+                //    } else {
+                //        printColumn(rowData.getAfterColumnsList());
+                //    }
+                //}
             }
         }
     }
