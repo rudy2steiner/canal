@@ -1,12 +1,9 @@
 package com.alibaba.otter.canal.example;
 
 import java.io.File;
-import java.io.FileInputStream;
 import java.io.FileNotFoundException;
-import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.RandomAccessFile;
-import java.nio.ByteBuffer;
 import java.nio.MappedByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.channels.FileChannel.MapMode;
@@ -15,7 +12,6 @@ import java.util.ArrayList;
 import java.util.Date;
 import java.util.List;
 
-import com.google.common.primitives.Bytes;
 import org.apache.commons.lang.SystemUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -35,6 +31,8 @@ import com.alibaba.otter.canal.protocol.CanalEntry.RowData;
 import com.alibaba.otter.canal.protocol.CanalEntry.TransactionBegin;
 import com.alibaba.otter.canal.protocol.CanalEntry.TransactionEnd;
 import com.alibaba.otter.canal.protocol.Message;
+
+import com.google.common.primitives.Bytes;
 import com.google.protobuf.InvalidProtocolBufferException;
 
 /**
@@ -48,19 +46,9 @@ public class AbstractCanalClientTest {
     protected final static Logger logger = LoggerFactory.getLogger(AbstractCanalClientTest.class);
     protected static final String SEP = SystemUtils.LINE_SEPARATOR;
     protected static final String DATE_FORMAT = "yyyy-MM-dd HH:mm:ss";
-    protected volatile boolean running = false;
-    protected Thread.UncaughtExceptionHandler handler = new Thread.UncaughtExceptionHandler() {
-
-        public void uncaughtException(Thread t, Throwable e) {
-            logger.error("parse events has an error", e);
-        }
-    };
-    protected Thread thread = null;
-    protected CanalConnector connector;
     protected static String context_format = null;
     protected static String row_format = null;
     protected static String transaction_format = null;
-    protected String destination;
 
     static {
         context_format = SEP + "****************************************************" + SEP;
@@ -76,6 +64,17 @@ public class AbstractCanalClientTest {
         transaction_format = SEP + "================> binlog[{}:{}] , executeTime : {} , delay : {}ms" + SEP;
 
     }
+
+    protected volatile boolean running = false;
+    protected Thread.UncaughtExceptionHandler handler = new Thread.UncaughtExceptionHandler() {
+
+        public void uncaughtException(Thread t, Throwable e) {
+            logger.error("parse events has an error", e);
+        }
+    };
+    protected Thread thread = null;
+    protected CanalConnector connector;
+    protected String destination;
 
     public AbstractCanalClientTest(String destination){
         this(destination, null);
@@ -190,8 +189,7 @@ public class AbstractCanalClientTest {
         }
 
         // ----------1. 初始化ChangeRecord所需的成员变量---------------
-        // id由binlog文件名和offset组成
-        String id = entry.getHeader().getLogfileName() + entry.getHeader().getLogfileOffset();
+
         // 时间戳，单位毫秒
         String timestamp = String.valueOf(entry.getHeader().getExecuteTime());
         // schema
@@ -222,7 +220,14 @@ public class AbstractCanalClientTest {
         //创建个byte数组
         byte[] resultBytes=new byte[0];
         logger.info("#################### List Size is:"+rowChage.getRowDatasList().size()+"  type:"+type+"##########\n");
-        for (RowData rowData : rowChage.getRowDatasList()) {
+        RowData rowData;
+        for (int i = 0; i < rowChage.getRowDatasList().size(); i++) {
+            // for (RowData rowData : rowChage.getRowDatasList()) {
+            // id由binlog文件名和offset组成
+            rowData = rowChage.getRowDatasList().get(i);
+            long basicOffset = Long.valueOf(entry.getHeader().getLogfileOffset());
+            long realOffset = basicOffset + i;
+            String id = entry.getHeader().getLogfileName() + String.valueOf(realOffset);
             List<ColumnChangeData> changeDataList = new ArrayList<ColumnChangeData>();
             if ("I".equals(type)) {
                 // 只有更新后的值
@@ -316,6 +321,7 @@ public class AbstractCanalClientTest {
             columnChangeData.setColumnName(columnNew.getName());
             columnChangeDataList.add(columnChangeData);
         }
+
 
         return columnChangeDataList;
     }

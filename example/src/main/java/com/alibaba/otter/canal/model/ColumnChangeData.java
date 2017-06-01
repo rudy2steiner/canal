@@ -27,7 +27,13 @@ public class ColumnChangeData{
      */
     private String newValue;
 
-    public ColumnChangeData(){}
+    public ColumnChangeData(){
+        this.columnName = "";
+        this.columnType = "";
+        this.isPrimaryKey = "";
+        this.oldValue = "";
+        this.newValue = "";
+    }
 
     public ColumnChangeData(String columnName, String columnType, String isPrimaryKey, String oldValue,
                             String newValue) {
@@ -86,9 +92,9 @@ public class ColumnChangeData{
     public String toString(){
         String SEP = Constants.SEP;
         //如果没更新过，就别输出了
-        if (oldValue.equals(newValue)) {
-            return "";
-        }
+        // if (oldValue.equals(newValue)) {
+        // return "";
+        // }
         return columnName + ":" + columnType + ":" + isPrimaryKey+SEP+oldValue+SEP+newValue+SEP;
     }
 }
