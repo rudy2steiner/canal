@@ -263,7 +263,7 @@ public class AbstractCanalClientTest {
      * @param resultBytes
      */
     protected void storeChangeToDisk(byte[] resultBytes) {
-        File destFile = new File("/Users/wanshao/work/canal_data/canal.txt");
+        File destFile = new File("/home/admin/1.txt");
 
         FileChannel fileInputChannel = null;
         try {
